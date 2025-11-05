@@ -1,6 +1,8 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+import copy
 import logging
 import warnings
+from dataclasses import astuple
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -113,9 +115,11 @@ def _get_param_groups(
             if not param.requires_grad:
                 continue
 
+            uses_default_config = False
             # Get optimizer config for this parameter.
             if config_overrides is None:
                 config_for_param = config
+                uses_default_config = True
             else:
                 config_for_param = None
                 for param_key in config_overrides:
@@ -125,6 +129,7 @@ def _get_param_groups(
                 # Fall back to default config.
                 if config_for_param is None:
                     config_for_param = config
+                    uses_default_config = True
 
             is_expert_parallel = not getattr(param, 'allreduce', True)
 
@@ -137,17 +142,20 @@ def _get_param_groups(
             else:
                 wd_mult = 0.0
 
-            from dataclasses import astuple
-
-            key = (wd_mult, is_expert_parallel, astuple(config_for_param))
+            # Create config_tuple that is hash-able. Remove timers object before
+            # creating config_tuple.
+            config_for_param_copy = copy.deepcopy(config_for_param)
+            config_for_param_copy.timers = None
+            config_tuple = astuple(config_for_param_copy)
+            key = (wd_mult, is_expert_parallel, config_tuple)
             if key not in params_map:
                 params_map[key] = []
             params_map[key].append(param)
 
             if key in configs_map:
-                assert config_for_param == configs_map[key]
+                assert (config_for_param, uses_default_config) == configs_map[key]
             else:
-                configs_map[key] = config_for_param
+                configs_map[key] = (config_for_param, uses_default_config)
 
     # Distributed checkpoint requires all ranks to have the same param groups,
     # so we need to align the param groups across ranks, otherwise we may have
@@ -164,11 +172,11 @@ def _get_param_groups(
     for key in params_key:
         wd_mult, is_expert_parallel, _ = key
         params = params_map[key] if key in params_map else []
-        config = None
+        config, uses_default_config = None, True
         if key not in configs_map:
             assert params == []
         else:
-            config = configs_map[key]
+            config, uses_default_config = configs_map[key]
             assert config is not None
 
         # TODO: Remove "backwards compatible" fields below eventually.
@@ -178,6 +186,7 @@ def _get_param_groups(
             'lr_mult': 1.0,  # For backwards compatibility.
             'is_expert_parallel': is_expert_parallel,
             'is_decoupled_lr': False,  # For backwards compatibility.
+            'default_config': uses_default_config,
         }
 
         # Stick relevant fields into param_group from config object.
